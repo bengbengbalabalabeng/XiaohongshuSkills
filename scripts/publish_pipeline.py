@@ -48,6 +48,10 @@ import random
 import re
 import sys
 import time
+import unicodedata
+import string
+import math
+from datetime import datetime, timedelta
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -81,6 +85,31 @@ def _is_local_host(host: str) -> bool:
     """Return True when host points to the local machine."""
     return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
 
+def _parse_excel_file(pathname: str | None):
+    """Read Excel file and return pandas DataFrame."""
+    import pandas as pd
+
+    if pathname == None:
+        return
+
+    if not isinstance(pathname, str) or not pathname.strip():
+        raise ValueError("Excel pathname must be a non-empty string.")
+
+    if not os.path.exists(pathname):
+        raise FileNotFoundError(f"Excel file not found: {pathname}")
+
+    print(f"[cdp_publish] Reading Excel file: {pathname}")
+
+    try:
+        df = pd.read_excel(pathname)
+    except Exception as err:
+        raise RuntimeError(f"Failed to read Excel file. Reason: {err}")
+
+    if df is None or df.empty:
+        raise ValueError("Excel file is empty or unreadable.")
+
+    print(f"[cdp_publish] Excel loaded. Rows: {len(df)}, Columns: {len(df.columns)}")
+    return df
 
 def _resolve_account_name(account_name: str | None) -> str:
     """Resolve explicit or default account name for login cache scoping."""
@@ -307,12 +336,12 @@ def main():
     )
 
     # Title
-    title_group = parser.add_mutually_exclusive_group(required=True)
+    title_group = parser.add_mutually_exclusive_group(required=False)
     title_group.add_argument("--title", help="Article title text")
     title_group.add_argument("--title-file", help="Read title from UTF-8 file")
 
     # Content
-    content_group = parser.add_mutually_exclusive_group(required=True)
+    content_group = parser.add_mutually_exclusive_group(required=False)
     content_group.add_argument("--content", help="Article body text")
     content_group.add_argument("--content-file", help="Read content from UTF-8 file")
 
@@ -323,8 +352,21 @@ def main():
         help="Scheduled publish time for Note (format: yyyy-MM-dd HH:mm, range: [now + 1h, now + 1h + 14 days)).",
     )
 
+    # Excel batch processing
+    parser.add_argument(
+        "--excel-file",
+        default=None,
+        help="Excel batch processing",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=3,
+        help="Interval time for excel batch processing (Default: 3s)",
+    )
+
     # Media: images OR video (mutually exclusive)
-    media_group = parser.add_mutually_exclusive_group(required=True)
+    media_group = parser.add_mutually_exclusive_group(required=False)
     media_group.add_argument(
         "--image-urls", nargs="+", help="Image URLs to download"
     )
@@ -436,6 +478,21 @@ def main():
             "[pipeline] Warning: --timing-jitter out of range. "
             f"Clamped to {timing_jitter:.2f}."
         )
+
+    if args.excel_file != None:
+        _handle_text_mode_batch_publish(
+            host,
+            port,
+            headless,
+            account,
+            cache_account_name,
+            reuse_existing_tab,
+            timing_jitter,
+            local_mode,
+            _parse_excel_file(args.excel_file),
+            args
+        )
+        return
 
     # --- Resolve title ---
     if args.title_file:
@@ -605,6 +662,192 @@ def main():
 
     print("[pipeline] Done.")
 
+def _handle_text_mode_batch_publish(
+    host,
+    port,
+    headless,
+    account,
+    cache_account_name,
+    reuse_existing_tab,
+    timing_jitter,
+    local_mode,
+    excel_data,
+    args,
+    ):
+    # --- Step 1: Ensure Chrome is running ---
+    mode_label = "headless" if headless else "headed"
+    account_label = cache_account_name
+    print(
+        f"[pipeline] Step 1: Ensuring Chrome is running "
+        f"({mode_label}, account: {account_label}, host: {host}, port: {port})..."
+    )
+    print(f"[pipeline] Timing jitter ratio: {timing_jitter:.2f}")
+    if reuse_existing_tab:
+        print("[pipeline] Tab selection mode: prefer reusing existing tab.")
+    if local_mode:
+        if not ensure_chrome(port=port, headless=headless, account=account):
+            print("Error: Failed to start Chrome.", file=sys.stderr)
+            sys.exit(2)
+    else:
+        print(
+            f"[pipeline] Remote CDP mode enabled: {host}:{port}. "
+            "Skipping local Chrome launch/restart."
+        )
+
+    # --- Step 2: Connect and check login ---
+    print("[pipeline] Step 2: Checking login status...")
+    publisher = XiaohongshuPublisher(
+        host=host,
+        port=port,
+        timing_jitter=timing_jitter,
+        account_name=cache_account_name,
+    )
+    try:
+        publisher.connect(reuse_existing_tab=reuse_existing_tab)
+        logged_in = publisher.check_login()
+        if not logged_in:
+            publisher.disconnect()
+            if headless:
+                if local_mode:
+                    # Auto-fallback: restart Chrome in headed mode for QR login
+                    print("[pipeline] Headless mode: not logged in. Switching to headed mode for login...")
+                    restart_chrome(port=port, headless=False, account=account)
+                    publisher.connect(reuse_existing_tab=reuse_existing_tab)
+                    publisher.open_login_page()
+                else:
+                    print(
+                        "[pipeline] Headless + remote mode: cannot auto-restart remote Chrome. "
+                        "Attempting to open login page on existing remote browser..."
+                    )
+                    publisher.connect(reuse_existing_tab=reuse_existing_tab)
+                    publisher.open_login_page()
+            print("NOT_LOGGED_IN")
+            sys.exit(1)
+    except CDPError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    
+    # Init downloader
+    downloader = None
+    downloader = ImageDownloader(temp_dir=args.temp_dir)
+
+    total = len(excel_data)
+    for idx, row in excel_data.iterrows():
+        title = row["title"]
+        title_len = _check_title_len(title)
+        if title_len > 20:
+            print(f"[pipeline] Sikp note [{title}], reason: too long [{title_len}]")
+            continue
+
+        content = row["content"]
+        last_line = row["tag"].strip()
+        topic_tags = [p for p in last_line.split() if p]
+        image_url = row["url"]
+        post_time = row["time"]
+    
+        print(f"[pipeline] ====================== Process ({idx + 1}/{total}) note [{title}] ======================")
+        print(f"[pipeline] content [{content}]")
+        print(f"[pipeline] topic_tags [{topic_tags}]")
+        print(f"[pipeline] image_url [{image_url}]")
+        print(f"[pipeline] post_time [{post_time}]")
+
+        # --- Step 3: Prepare media ---
+        image_paths = []
+
+        print(f"[pipeline] Step 3: Downloading image...")
+        image_paths = downloader.download_all([image_url])
+        if not image_paths:
+            print("Error: All image downloads failed.", file=sys.stderr)
+            sys.exit(2)
+        
+        # --- Step 4: Fill form ---
+        print("[pipeline] Step 4: Filling form...")
+        try:
+            publisher.publish(
+                title=title, content=content, image_paths=image_paths, post_time=post_time
+            )
+            _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
+            print("FILL_STATUS: READY_TO_PUBLISH")
+        except CDPError as e:
+            print(f"Error during form fill: {e}", file=sys.stderr)
+            if downloader:
+                downloader.cleanup()
+            sys.exit(2)
+        
+        # --- Step 5: Publish (optional) ---
+        should_publish = not args.preview
+        if args.auto_publish:
+            print("[pipeline] --auto-publish is now default and can be omitted.")
+        if args.preview:
+            print("[pipeline] Preview mode is on, skipping publish click.")
+
+        if should_publish:
+            print("[pipeline] Step 5: Clicking publish button...")
+            try:
+                note_link = publisher._click_publish(post_time != None)
+                print("PUBLISH_STATUS: PUBLISHED")
+                if note_link:
+                    print(f"[pipeline] Note published at: {note_link}")
+            except CDPError as e:
+                print(f"Error clicking publish: {e}", file=sys.stderr)
+                if downloader:
+                    downloader.cleanup()
+                sys.exit(2)
+        
+        print(f"[pipeline] Finished ({idx + 1}/{total})")
+        if (idx + 1) == total:
+            break
+
+        totalSeconds = args.interval + (args.interval * 0.2)
+        print(f"[pipeline] Sleep >={totalSeconds}s. Next-Task-Time: {_format_next_task_time(totalSeconds)}")
+        for _ in range(args.interval):
+            publisher._sleep(1, minimum_seconds=0.5)
+            try:
+                publisher.keepalive(0.2)
+            except Exception:
+                pass
+
+    # --- Cleanup ---
+    publisher.disconnect()
+    if downloader:
+        downloader.cleanup()
+
+    print("[pipeline] Done.")
+    return
+
+def _check_title_len(text: str | None) -> int:
+    if text == None:
+        return 0
+    
+    total = 0.0
+    
+    for ch in text:
+        # 英文、数字、空格、英文标点（ASCII）
+        if ch in string.ascii_letters or ch in string.digits or ch == " " or ch in string.punctuation:
+            total += 0.5
+            continue
+        
+        # 中文字符（包括中文标点）
+        # CJK Unified Ideographs: \u4e00 - \u9fff
+        # CJK Symbols & Punctuation: \u3000 - \u303f
+        # Fullwidth punctuation: \uff00 - \uffef
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF or
+            0x3000 <= code <= 0x303F or
+            0xFF00 <= code <= 0xFFEF
+        ):
+            total += 1.0
+            continue
+        
+        # 其它 Unicode（emoji、特殊符号等）
+        total += 2.0
+    
+    return math.ceil(total)
+
+def _format_next_task_time(seconds: int) -> str:
+    target = datetime.now() + timedelta(seconds=seconds)
+    return target.strftime("%H:%M")
 
 if __name__ == "__main__":
     try:

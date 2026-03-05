@@ -48,6 +48,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlparse
 from typing import Any
+from datetime import datetime, timedelta
+import pandas as pd
 
 # Add scripts dir to path so sibling modules can be imported in both
 # "python scripts/cdp_publish.py" and "import scripts.cdp_publish" modes.
@@ -523,6 +525,11 @@ class XiaohongshuPublisher:
         if self.ws:
             self.ws.close()
             self.ws = None
+
+    def keepalive(self, timeout: float = 0.2):
+        """Receive any pending messages to keep the connection alive and prevent timeouts."""
+        if self.ws:
+            self.ws.recv(timeout)
 
     # ------------------------------------------------------------------
     # CDP command helpers
