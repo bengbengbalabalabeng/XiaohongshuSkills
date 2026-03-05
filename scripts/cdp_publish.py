@@ -2002,21 +2002,37 @@ class XiaohongshuPublisher:
         if post_time == None:
             return
         
-        print(f"[cdp_publish] Setting schedule publish time: {post_time}")
+        escaped_post_time = json.dumps(post_time)
+
+        print(f"[cdp_publish] Setting schedule publish time: {escaped_post_time}")
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
+
+        post_time_btn_clicked = self._evaluate(f"""
+            (function() {{
+                try {{
+                    // Click scheduled publish btn
+                    var selector = '.post-time-wrapper .d-switch';
+                    var el = document.querySelector(selector);
+                    if (el == null) {{
+                        return 'Schedule publish button is missing.';
+                    }}
+                    el.click();
+                    return 'ok';
+                }} catch (err) {{
+                    return String(err);
+                }}
+            }})();
+        """)
+
+        if not post_time_btn_clicked == 'ok':
+            raise CDPError("Could not click scheduled publish button. Reason:" + post_time_btn_clicked)
+        
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
         post_time_enabled = self._evaluate(f"""
             (async function() {{
                 try {{
-                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-                    // Click scheduled publish btn
-                    var selector = '.post-time-wrapper .d-switch';
-                    var element = document.querySelector(selector);
-                    element.click();
-                    await sleep(150);
-                    
-                    // Set publish time
+                    // Set scheduled publish time
                     const el = document.querySelector('.date-picker-container input');
                     if (el == null) {{
                         return 'Schedule publish date-picker input is missing.';
@@ -2025,7 +2041,7 @@ class XiaohongshuPublisher:
                         window.HTMLInputElement.prototype, 'value'
                     ).set;
                     el.focus();
-                    nativeSetter.call(el, '{post_time}');
+                    nativeSetter.call(el, '{escaped_post_time}');
 
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
